@@ -1,5 +1,5 @@
 
-# Performance Benchmarking Report: Skymind 2.6 (Kimi-K2.6) on NVIDIA B200
+# Performance Benchmarking Report: Kimi-K2.6 on NVIDIA B200 (A4 High)
 
 ## 1. Model Overview
 
