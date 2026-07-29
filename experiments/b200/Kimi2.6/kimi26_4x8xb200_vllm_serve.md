@@ -60,7 +60,7 @@ To ensure exact reproducibility and avoid common third-party schema issues (e.g.
 
 ```bash
 kubectl get pods -n dynamo-cloud
-# (Pick any pod)
+# (Pick any pod for benchmarking)
 
 ```
 
@@ -175,11 +175,26 @@ The following tables highlight the hardware's resilience. Throughout all sweeps,
 
 ---
 
-## 6. Next Steps: 64K+ Context Testing
+## 6. Next Steps: 64K+ and 128K+ Context Testing
 
-To benchmark the model's performance at 64,000 tokens and beyond, the Kubernetes deployment must be updated to explicitly permit larger contexts.
+Having successfully validated the cluster's stability, linear MoE scaling, and memory bandwidth up to a 30,000-token context window, the natural next step for advanced benchmarking is pushing the deployment into the 64K and 128K territory.
 
-A secondary YAML file (attached separately) modifies the `vllm-server` startup arguments to include `--max-model-len 65536`. Once applied, the same benchmark methodology detailed in Section 4 can be utilized to measure the absolute upper bounds of the KV Cache before hard OOM failures occur.
+**When Does 128K Context Make Sense?**
+In enterprise deployments, massive context windows are rarely used for generating huge outputs, as sequential decode times for tens of thousands of tokens would take hours. Instead, long-context testing is almost exclusively relevant for **Prefill-Heavy** workloads, where the model must ingest a massive amount of provided data to generate a concise, targeted response.
+
+Highly practical use cases for 128K contexts include:
+
+1. **Log & Security Analysis:** Ingesting 100,000+ tokens of raw server error logs or telemetry data to output a focused, 500-token root-cause summary.
+2. **RAG & Enterprise Search:** Passing dozens of dense PDFs, financial reports, or knowledge-base articles into the prompt simultaneously to extract specific metrics.
+3. **Codebase Refactoring:** Providing an entire multi-file repository as context to identify security vulnerabilities or ask architectural questions.
+
+**How to Execute 128K Benchmarks**
+To simulate these long-context scenarios (e.g., an extreme workload of 120,000 ISL / 1,000 OSL), the deployment configuration must be adjusted to allocate the necessary KV Cache blocks:
+
+1. **Update the YAML:** Modify the `vllm-server` startup arguments in your Kubernetes deployment file to increase the hard safety limit: `--max-model-len 131072` (which is 128K * 1024).
+2. **Calculate Safe Concurrency:** vLLM's primary memory bottleneck is dictated by the total active tokens residing in the KV Cache at any given millisecond. Before running the `vllm bench serve` command, use this formula to plan your concurrency:
+**Total Active Tokens = Concurrency × (ISL + OSL)**
+*Context:* During our 30K benchmark, the 32-GPU cluster successfully held ~7.9 million active tokens (256 concurrency × 31,000 tokens) without an Out-Of-Memory (OOM) crash. Therefore, you can safely test a 128K context window by intentionally capping the concurrency at 16 or 32 (which yields ~2 million to ~4 million active tokens), guaranteeing the GPUs can digest the massive prefill phase safely.
 
 ---
 
