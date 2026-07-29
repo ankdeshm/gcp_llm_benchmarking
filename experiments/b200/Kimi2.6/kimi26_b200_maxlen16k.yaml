@@ -1,0 +1,185 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kimi-2.6-standard
+  namespace: dynamo-cloud
+  labels:
+    app: kimi-2.6-standard
+spec:
+  replicas: 4                          # 4 Replicas (1 per Node)
+  selector:
+    matchLabels:
+      app: kimi-2.6-standard
+  template:
+    metadata:
+      labels:
+        app: kimi-2.6-standard
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-accelerator: "nvidia-b200"
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: cloud.google.com/gke-spot
+                operator: In
+                values: ["true"]
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Equal"
+          value: "present"
+          effect: "NoSchedule"
+        - key: "cloud.google.com/gke-preemptible"
+          operator: "Equal"
+          value: "true"
+          effect: "NoExecute"
+          tolerationSeconds: 30
+          
+      imagePullSecrets:
+        - name: nvcr-secret
+        
+      volumes:
+        - name: gib
+          emptyDir: {}
+        - name: local-ssd
+          hostPath:
+            path: /mnt/stateful_partition/kube-ephemeral-ssd
+        - name: shared-memory
+          emptyDir:
+            medium: "Memory"
+            sizeLimit: 200Gi
+
+      initContainers:
+      - name: nccl-plugin-installer
+        image: us-docker.pkg.dev/gce-ai-infra/gpudirect-gib/nccl-plugin-gib:v1.1.2
+        imagePullPolicy: Always
+        args:
+        - |
+          set -ex
+          /scripts/container_entry.sh install --install-nccl
+          cp -R /var/lib/gib/lib64/. /target/usr/local/gib/lib64
+          cp -R /var/lib/gib/. /target/usr/local/gib
+        command: ["/bin/sh", "-c"]
+        volumeMounts:
+        - mountPath: /target/usr/local/gib
+          name: gib
+
+      - name: model-downloader
+        image: python:3.10-slim
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          MODEL_ID="moonshotai/Kimi-K2.6"
+          LOCAL_DIR="/ssd/moonshotai/Kimi-K2.6"
+          
+          if [ -f "${LOCAL_DIR}/.download_complete" ]; then exit 0; fi
+          
+          pip install huggingface_hub
+          
+          # Turn OFF the aggressive Rust downloader
+          export HF_HUB_ENABLE_HF_TRANSFER="0"
+          
+          echo "Starting stable CLI download..."
+          
+          # Use the new 'hf' CLI tool as required by the latest huggingface_hub version
+          until hf download ${MODEL_ID} --local-dir ${LOCAL_DIR} --token ${HF_TOKEN} --max-workers 4; do
+              echo "Network drop or rate limit. Resuming in 10 seconds..."
+              sleep 10
+          done
+          
+          touch "${LOCAL_DIR}/.download_complete"
+          echo "Download fully completed!"
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-secret
+              key: hf_api_token
+        volumeMounts:
+        - name: local-ssd
+          mountPath: /ssd
+
+      containers:
+        - name: vllm-server
+          image: "nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1" 
+          securityContext:
+            privileged: true
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-secret
+                  key: hf_api_token
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "compute,utility"
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              export NCCL_PLUGIN_PATH=/usr/local/gib/lib64
+              export LD_LIBRARY_PATH=/usr/local/gib/lib64:/usr/local/nvidia/lib64:$LD_LIBRARY_PATH
+              export NCCL_INIT_SCRIPT="/usr/local/gib/scripts/set_nccl_env.sh"
+              
+              if [[ -n "${NCCL_INIT_SCRIPT}" ]]; then source ${NCCL_INIT_SCRIPT}; /sbin/ldconfig; fi
+              export VLLM_NCCL_SO_PATH=/usr/local/gib/lib64/libnccl.so.2
+              export NCCL_DEBUG=INFO
+
+              # Directly assign all 8 GPUs to this replica
+              export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+              echo "Standard Worker Assigned CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+
+              python3 -m vllm.entrypoints.openai.api_server \
+                --model /ssd/moonshotai/Kimi-K2.6 \
+                --tokenizer moonshotai/Kimi-K2.6 \
+                --served-model-name moonshotai/Kimi-K2.6 \
+                --tensor-parallel-size 8 \
+                --enable-expert-parallel \
+                --tool-call-parser kimi_k2 \
+                --reasoning-parser kimi_k2 \
+                --mm-encoder-tp-mode data \
+                --kv-cache-dtype fp8 \
+                --block-size 128 \
+                --max-num-batched-tokens 16384 \
+                --trust-remote-code \
+                --no-enable-prefix-caching \
+                --download-dir /ssd/moonshotai/Kimi-K2.6 \
+                --disable-log-stats \
+                --max-model-len 32768 \
+                --gpu-memory-utilization 0.95 \
+                --port 8000
+
+          resources:
+            limits:
+              cpu: "80"
+              memory: "800Gi"
+              nvidia.com/gpu: 8
+            requests:
+              cpu: "80"
+              memory: "800Gi"
+              nvidia.com/gpu: 8
+          
+          volumeMounts:
+            - name: gib
+              mountPath: /usr/local/gib
+            - name: local-ssd
+              mountPath: /ssd
+            - name: shared-memory
+              mountPath: /dev/shm
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kimi-26-standard-service
+  namespace: dynamo-cloud
+spec:
+  selector:
+    app: kimi-2.6-standard
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
